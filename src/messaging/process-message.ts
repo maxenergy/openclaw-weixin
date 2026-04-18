@@ -14,6 +14,7 @@ import { MessageItemType, TypingStatus } from "../api/types.js";
 import { loadWeixinAccount } from "../auth/accounts.js";
 import { readFrameworkAllowFromList } from "../auth/pairing.js";
 import { downloadRemoteImageToTemp } from "../cdn/upload.js";
+import { RAVBOT_WEIXIN_CHANNEL_ID } from "../ids.js";
 import { downloadMediaFromItem } from "../media/media-download.js";
 import { logger } from "../util/logger.js";
 import { redactBody, redactToken } from "../util/redact.js";
@@ -30,8 +31,42 @@ import type { WeixinInboundMediaOpts } from "./inbound.js";
 import { sendWeixinMediaFile } from "./send-media.js";
 import { markdownToPlainText, sendMessageWeixin } from "./send.js";
 import { handleSlashCommand } from "./slash-commands.js";
+import { getSkillCatalogText, isSkillCatalogQuery } from "../skills/skill-catalog.js";
+import {
+  buildWorkflowPrompt,
+  getWorkflowStatusText,
+  isWorkflowStatusQuery,
+  markWorkflowBlocked,
+  markWorkflowProgress,
+} from "../workflow/generic-task-workflow.js";
 
 const MEDIA_OUTBOUND_TEMP_DIR = path.join(resolvePreferredOpenClawTmpDir(), "weixin/media/outbound-temp");
+
+function classifyProviderFailure(text: string): "provider_auth_failed" | "provider_unavailable" | null {
+  const normalized = text.toLowerCase();
+  if (
+    normalized.includes("invalid_api_key") ||
+    normalized.includes("invalid access token") ||
+    normalized.includes("token expired") ||
+    normalized.includes("status 401") ||
+    normalized.includes("status 403")
+  ) {
+    return "provider_auth_failed";
+  }
+  if (
+    normalized.includes("status 429") ||
+    normalized.includes("status 500") ||
+    normalized.includes("status 502") ||
+    normalized.includes("status 503") ||
+    normalized.includes("status 504") ||
+    normalized.includes("http request failed") ||
+    normalized.includes("timeout") ||
+    normalized.includes("[fallback_attempted:")
+  ) {
+    return "provider_unavailable";
+  }
+  return null;
+}
 
 /** Dependencies for processOneMessage, injected by the monitor loop. */
 export type ProcessMessageDeps = {
@@ -213,7 +248,7 @@ export async function processOneMessage(
 
   const route = deps.channelRuntime.routing.resolveAgentRoute({
     cfg: deps.config,
-    channel: "openclaw-weixin",
+    channel: RAVBOT_WEIXIN_CHANNEL_ID,
     accountId: deps.accountId,
     peer: { kind: "direct", id: ctx.To },
   });
@@ -236,12 +271,48 @@ export async function processOneMessage(
   // the correct session (matching the dmScope from config) instead of falling back
   // to agent:main:main.
   ctx.SessionKey = route.sessionKey;
+  if (isSkillCatalogQuery(rawBody)) {
+    const skillCatalogText = await getSkillCatalogText();
+    await sendMessageWeixin({
+      to: ctx.To,
+      text: skillCatalogText,
+      opts: {
+        baseUrl: deps.baseUrl,
+        token: deps.token,
+        contextToken: getContextTokenFromMsgContext(ctx),
+      },
+    });
+    logger.info(`skill-catalog: sent session=${route.sessionKey ?? "(none)"}`);
+    return;
+  }
+  if (isWorkflowStatusQuery(rawBody)) {
+    const statusText = await getWorkflowStatusText(route.sessionKey ?? ctx.SessionKey ?? "");
+    await sendMessageWeixin({
+      to: ctx.To,
+      text: statusText,
+      opts: {
+        baseUrl: deps.baseUrl,
+        token: deps.token,
+        contextToken: getContextTokenFromMsgContext(ctx),
+      },
+    });
+    logger.info(`workflow-status: sent session=${route.sessionKey ?? "(none)"}`);
+    return;
+  }
   const storePath = deps.channelRuntime.session.resolveStorePath(deps.config.session?.store, {
     agentId: route.agentId,
   });
   const finalized = deps.channelRuntime.reply.finalizeInboundContext(
     ctx as Parameters<typeof deps.channelRuntime.reply.finalizeInboundContext>[0],
   );
+  const workflowPrompt = await buildWorkflowPrompt(
+    route.sessionKey ?? finalized.SessionKey ?? "",
+    finalized.Body ?? "",
+  );
+  const finalizedForDispatch = {
+    ...finalized,
+    Body: workflowPrompt.body,
+  };
 
   logger.info(
     `inbound: from=${finalized.From} to=${finalized.To} bodyLen=${(finalized.Body ?? "").length} hasMedia=${Boolean(finalized.MediaPath ?? finalized.MediaUrl)}`,
@@ -254,7 +325,7 @@ export async function processOneMessage(
     ctx: finalized as Parameters<typeof deps.channelRuntime.session.recordInboundSession>[0]["ctx"],
     updateLastRoute: {
       sessionKey: route.mainSessionKey,
-      channel: "openclaw-weixin",
+      channel: RAVBOT_WEIXIN_CHANNEL_ID,
       to: ctx.To,
       accountId: deps.accountId,
     },
@@ -303,6 +374,7 @@ export async function processOneMessage(
 
   /** Delivery records populated synchronously at deliver() entry, safe to read in finally. */
   const debugDeliveries: Array<{ textLen: number; media: string; preview: string; ts: number }> = [];
+  const deliveredPayloads: Array<{ text: string; mediaUrl?: string; ts: number }> = [];
 
   const { dispatcher, replyOptions, markDispatchIdle } =
     deps.channelRuntime.reply.createReplyDispatcherWithTyping({
@@ -324,6 +396,7 @@ export async function processOneMessage(
             ts: Date.now(),
           });
         }
+        deliveredPayloads.push({ text, mediaUrl, ts: Date.now() });
 
         try {
           if (mediaUrl) {
@@ -406,22 +479,49 @@ export async function processOneMessage(
     });
 
   logger.debug(`dispatchReplyFromConfig: starting agentId=${route.agentId ?? "(none)"}`);
+  let dispatchResult:
+    | Awaited<ReturnType<typeof deps.channelRuntime.reply.dispatchReplyFromConfig>>
+    | undefined;
   try {
-    await deps.channelRuntime.reply.withReplyDispatcher({
+    dispatchResult = await deps.channelRuntime.reply.withReplyDispatcher({
       dispatcher,
       run: () =>
         deps.channelRuntime.reply.dispatchReplyFromConfig({
-          ctx: finalized,
+          ctx: finalizedForDispatch,
           cfg: deps.config,
           dispatcher,
           replyOptions: { ...replyOptions, disableBlockStreaming: false },
         }),
     });
+    const lastDeliveredText = deliveredPayloads.at(-1)?.text ?? "";
+    const providerFailure = classifyProviderFailure(lastDeliveredText);
+    if (providerFailure) {
+      await markWorkflowBlocked(
+        route.sessionKey ?? finalized.SessionKey ?? "",
+        providerFailure,
+        lastDeliveredText,
+      );
+    } else if (dispatchResult?.queuedFinal || deliveredPayloads.length > 0) {
+      await markWorkflowProgress(
+        route.sessionKey ?? finalized.SessionKey ?? "",
+        deliveredPayloads.length > 0
+          ? `本轮已成功发出回复，最后一条长度=${lastDeliveredText.length}`
+          : "本轮任务已推进，没有出现 provider 阻塞。",
+      );
+    }
     logger.debug(`dispatchReplyFromConfig: done agentId=${route.agentId ?? "(none)"}`);
   } catch (err) {
     logger.error(
       `dispatchReplyFromConfig: error agentId=${route.agentId ?? "(none)"} err=${String(err)}`,
     );
+    const providerFailure = classifyProviderFailure(err instanceof Error ? err.message : String(err));
+    if (providerFailure) {
+      await markWorkflowBlocked(
+        route.sessionKey ?? finalized.SessionKey ?? "",
+        providerFailure,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
     throw err;
   } finally {
     markDispatchIdle();
