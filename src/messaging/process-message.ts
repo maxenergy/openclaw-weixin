@@ -31,8 +31,6 @@ import type { WeixinInboundMediaOpts } from "./inbound.js";
 import { sendWeixinMediaFile } from "./send-media.js";
 import { markdownToPlainText, sendMessageWeixin } from "./send.js";
 import { handleSlashCommand } from "./slash-commands.js";
-import { getSkillCatalogText, isSkillCatalogQuery } from "../skills/skill-catalog.js";
-import { getToolCatalogText, isToolCatalogQuery } from "../skills/tool-catalog.js";
 import {
   buildWorkflowPrompt,
   getWorkflowStatusText,
@@ -272,34 +270,6 @@ export async function processOneMessage(
   // the correct session (matching the dmScope from config) instead of falling back
   // to agent:main:main.
   ctx.SessionKey = route.sessionKey;
-  if (isSkillCatalogQuery(rawBody)) {
-    const skillCatalogText = await getSkillCatalogText();
-    await sendMessageWeixin({
-      to: ctx.To,
-      text: skillCatalogText,
-      opts: {
-        baseUrl: deps.baseUrl,
-        token: deps.token,
-        contextToken: getContextTokenFromMsgContext(ctx),
-      },
-    });
-    logger.info(`skill-catalog: sent session=${route.sessionKey ?? "(none)"}`);
-    return;
-  }
-  if (isToolCatalogQuery(rawBody)) {
-    const toolCatalogText = getToolCatalogText();
-    await sendMessageWeixin({
-      to: ctx.To,
-      text: toolCatalogText,
-      opts: {
-        baseUrl: deps.baseUrl,
-        token: deps.token,
-        contextToken: getContextTokenFromMsgContext(ctx),
-      },
-    });
-    logger.info(`tool-catalog: sent session=${route.sessionKey ?? "(none)"}`);
-    return;
-  }
   if (isWorkflowStatusQuery(rawBody)) {
     const statusText = await getWorkflowStatusText(route.sessionKey ?? ctx.SessionKey ?? "");
     await sendMessageWeixin({
