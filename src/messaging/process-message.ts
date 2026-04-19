@@ -32,6 +32,7 @@ import { sendWeixinMediaFile } from "./send-media.js";
 import { markdownToPlainText, sendMessageWeixin } from "./send.js";
 import { handleSlashCommand } from "./slash-commands.js";
 import { getSkillCatalogText, isSkillCatalogQuery } from "../skills/skill-catalog.js";
+import { getToolCatalogText, isToolCatalogQuery } from "../skills/tool-catalog.js";
 import {
   buildWorkflowPrompt,
   getWorkflowStatusText,
@@ -283,6 +284,20 @@ export async function processOneMessage(
       },
     });
     logger.info(`skill-catalog: sent session=${route.sessionKey ?? "(none)"}`);
+    return;
+  }
+  if (isToolCatalogQuery(rawBody)) {
+    const toolCatalogText = getToolCatalogText();
+    await sendMessageWeixin({
+      to: ctx.To,
+      text: toolCatalogText,
+      opts: {
+        baseUrl: deps.baseUrl,
+        token: deps.token,
+        contextToken: getContextTokenFromMsgContext(ctx),
+      },
+    });
+    logger.info(`tool-catalog: sent session=${route.sessionKey ?? "(none)"}`);
     return;
   }
   if (isWorkflowStatusQuery(rawBody)) {
