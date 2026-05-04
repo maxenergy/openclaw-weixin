@@ -14,13 +14,13 @@ import { MessageItemType, TypingStatus } from "../api/types.js";
 import { loadWeixinAccount } from "../auth/accounts.js";
 import { readFrameworkAllowFromList } from "../auth/pairing.js";
 import { downloadRemoteImageToTemp } from "../cdn/upload.js";
-import { RAVBOT_WEIXIN_CHANNEL_ID } from "../ids.js";
 import { downloadMediaFromItem } from "../media/media-download.js";
 import { logger } from "../util/logger.js";
 import { redactBody, redactToken } from "../util/redact.js";
 
 import { isDebugMode } from "./debug-mode.js";
 import { sendWeixinErrorNotice } from "./error-notice.js";
+import { applyWeixinMessageSendingHook, emitWeixinMessageSent } from "./outbound-hooks.js";
 import {
   setContextToken,
   weixinMessageToMsgContext,
@@ -29,43 +29,11 @@ import {
 } from "./inbound.js";
 import type { WeixinInboundMediaOpts } from "./inbound.js";
 import { sendWeixinMediaFile } from "./send-media.js";
-import { markdownToPlainText, sendMessageWeixin } from "./send.js";
+import { StreamingMarkdownFilter } from "./markdown-filter.js";
+import { sendMessageWeixin } from "./send.js";
 import { handleSlashCommand } from "./slash-commands.js";
-import {
-  buildWorkflowPrompt,
-  getWorkflowStatusText,
-  isWorkflowStatusQuery,
-  markWorkflowBlocked,
-  markWorkflowProgress,
-} from "../workflow/generic-task-workflow.js";
 
 const MEDIA_OUTBOUND_TEMP_DIR = path.join(resolvePreferredOpenClawTmpDir(), "weixin/media/outbound-temp");
-
-function classifyProviderFailure(text: string): "provider_auth_failed" | "provider_unavailable" | null {
-  const normalized = text.toLowerCase();
-  if (
-    normalized.includes("invalid_api_key") ||
-    normalized.includes("invalid access token") ||
-    normalized.includes("token expired") ||
-    normalized.includes("status 401") ||
-    normalized.includes("status 403")
-  ) {
-    return "provider_auth_failed";
-  }
-  if (
-    normalized.includes("status 429") ||
-    normalized.includes("status 500") ||
-    normalized.includes("status 502") ||
-    normalized.includes("status 503") ||
-    normalized.includes("status 504") ||
-    normalized.includes("http request failed") ||
-    normalized.includes("timeout") ||
-    normalized.includes("[fallback_attempted:")
-  ) {
-    return "provider_unavailable";
-  }
-  return null;
-}
 
 /** Dependencies for processOneMessage, injected by the monitor loop. */
 export type ProcessMessageDeps = {
@@ -247,7 +215,7 @@ export async function processOneMessage(
 
   const route = deps.channelRuntime.routing.resolveAgentRoute({
     cfg: deps.config,
-    channel: RAVBOT_WEIXIN_CHANNEL_ID,
+    channel: "openclaw-weixin",
     accountId: deps.accountId,
     peer: { kind: "direct", id: ctx.To },
   });
@@ -270,34 +238,12 @@ export async function processOneMessage(
   // the correct session (matching the dmScope from config) instead of falling back
   // to agent:main:main.
   ctx.SessionKey = route.sessionKey;
-  if (isWorkflowStatusQuery(rawBody)) {
-    const statusText = await getWorkflowStatusText(route.sessionKey ?? ctx.SessionKey ?? "");
-    await sendMessageWeixin({
-      to: ctx.To,
-      text: statusText,
-      opts: {
-        baseUrl: deps.baseUrl,
-        token: deps.token,
-        contextToken: getContextTokenFromMsgContext(ctx),
-      },
-    });
-    logger.info(`workflow-status: sent session=${route.sessionKey ?? "(none)"}`);
-    return;
-  }
   const storePath = deps.channelRuntime.session.resolveStorePath(deps.config.session?.store, {
     agentId: route.agentId,
   });
   const finalized = deps.channelRuntime.reply.finalizeInboundContext(
     ctx as Parameters<typeof deps.channelRuntime.reply.finalizeInboundContext>[0],
   );
-  const workflowPrompt = await buildWorkflowPrompt(
-    route.sessionKey ?? finalized.SessionKey ?? "",
-    finalized.Body ?? "",
-  );
-  const finalizedForDispatch = {
-    ...finalized,
-    Body: workflowPrompt.body,
-  };
 
   logger.info(
     `inbound: from=${finalized.From} to=${finalized.To} bodyLen=${(finalized.Body ?? "").length} hasMedia=${Boolean(finalized.MediaPath ?? finalized.MediaUrl)}`,
@@ -310,7 +256,7 @@ export async function processOneMessage(
     ctx: finalized as Parameters<typeof deps.channelRuntime.session.recordInboundSession>[0]["ctx"],
     updateLastRoute: {
       sessionKey: route.mainSessionKey,
-      channel: RAVBOT_WEIXIN_CHANNEL_ID,
+      channel: "openclaw-weixin",
       to: ctx.To,
       accountId: deps.accountId,
     },
@@ -359,14 +305,17 @@ export async function processOneMessage(
 
   /** Delivery records populated synchronously at deliver() entry, safe to read in finally. */
   const debugDeliveries: Array<{ textLen: number; media: string; preview: string; ts: number }> = [];
-  const deliveredPayloads: Array<{ text: string; mediaUrl?: string; ts: number }> = [];
 
   const { dispatcher, replyOptions, markDispatchIdle } =
     deps.channelRuntime.reply.createReplyDispatcherWithTyping({
       humanDelay,
       typingCallbacks,
       deliver: async (payload) => {
-        const text = markdownToPlainText(payload.text ?? "");
+        const rawText = payload.text ?? "";
+        let text = (() => {
+          const f = new StreamingMarkdownFilter();
+          return f.feed(rawText) + f.flush();
+        })();
         const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
         logger.debug(`outbound payload: ${redactBody(JSON.stringify(payload))}`);
         logger.info(
@@ -381,13 +330,23 @@ export async function processOneMessage(
             ts: Date.now(),
           });
         }
-        deliveredPayloads.push({ text, mediaUrl, ts: Date.now() });
+
+        const sendingResult = await applyWeixinMessageSendingHook({
+          to: ctx.To,
+          text,
+          accountId: deps.accountId,
+          mediaUrl,
+        });
+        if (sendingResult.cancelled) {
+          logger.info(`outbound: cancelled by message_sending hook to=${ctx.To}`);
+          return;
+        }
+        text = sendingResult.text;
 
         try {
           if (mediaUrl) {
             let filePath: string;
             if (!mediaUrl.includes("://") || mediaUrl.startsWith("file://")) {
-              // Local path: absolute, relative, or file:// URL
               if (mediaUrl.startsWith("file://")) {
                 filePath = new URL(mediaUrl).pathname;
               } else if (!path.isAbsolute(mediaUrl)) {
@@ -410,6 +369,7 @@ export async function processOneMessage(
                 token: deps.token,
                 contextToken,
               }});
+              emitWeixinMessageSent({ to: ctx.To, content: text, success: true, accountId: deps.accountId });
               logger.info(`outbound: text sent to=${ctx.To}`);
               return;
             }
@@ -420,6 +380,7 @@ export async function processOneMessage(
               opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken },
               cdnBaseUrl: deps.cdnBaseUrl,
             });
+            emitWeixinMessageSent({ to: ctx.To, content: text, success: true, accountId: deps.accountId });
             logger.info(`outbound: media sent OK to=${ctx.To}`);
           } else {
             logger.debug(`outbound: sending text message to=${ctx.To}`);
@@ -428,9 +389,11 @@ export async function processOneMessage(
               token: deps.token,
               contextToken,
             }});
+            emitWeixinMessageSent({ to: ctx.To, content: text, success: true, accountId: deps.accountId });
             logger.info(`outbound: text sent OK to=${ctx.To}`);
           }
         } catch (err) {
+          emitWeixinMessageSent({ to: ctx.To, content: text, success: false, error: String(err), accountId: deps.accountId });
           logger.error(
             `outbound: FAILED to=${ctx.To} mediaUrl=${mediaUrl ?? "none"} err=${String(err)} stack=${(err as Error).stack ?? ""}`,
           );
@@ -464,55 +427,28 @@ export async function processOneMessage(
     });
 
   logger.debug(`dispatchReplyFromConfig: starting agentId=${route.agentId ?? "(none)"}`);
-  let dispatchResult:
-    | Awaited<ReturnType<typeof deps.channelRuntime.reply.dispatchReplyFromConfig>>
-    | undefined;
   try {
-    dispatchResult = await deps.channelRuntime.reply.withReplyDispatcher({
+    await deps.channelRuntime.reply.withReplyDispatcher({
       dispatcher,
       run: () =>
         deps.channelRuntime.reply.dispatchReplyFromConfig({
-          ctx: finalizedForDispatch,
+          ctx: finalized,
           cfg: deps.config,
           dispatcher,
-          replyOptions: { ...replyOptions, disableBlockStreaming: false },
+          replyOptions: { ...replyOptions, disableBlockStreaming: true },
         }),
     });
-    const lastDeliveredText = deliveredPayloads.at(-1)?.text ?? "";
-    const providerFailure = classifyProviderFailure(lastDeliveredText);
-    if (providerFailure) {
-      await markWorkflowBlocked(
-        route.sessionKey ?? finalized.SessionKey ?? "",
-        providerFailure,
-        lastDeliveredText,
-      );
-    } else if (dispatchResult?.queuedFinal || deliveredPayloads.length > 0) {
-      await markWorkflowProgress(
-        route.sessionKey ?? finalized.SessionKey ?? "",
-        deliveredPayloads.length > 0
-          ? `本轮已成功发出回复，最后一条长度=${lastDeliveredText.length}`
-          : "本轮任务已推进，没有出现 provider 阻塞。",
-      );
-    }
     logger.debug(`dispatchReplyFromConfig: done agentId=${route.agentId ?? "(none)"}`);
   } catch (err) {
     logger.error(
       `dispatchReplyFromConfig: error agentId=${route.agentId ?? "(none)"} err=${String(err)}`,
     );
-    const providerFailure = classifyProviderFailure(err instanceof Error ? err.message : String(err));
-    if (providerFailure) {
-      await markWorkflowBlocked(
-        route.sessionKey ?? finalized.SessionKey ?? "",
-        providerFailure,
-        err instanceof Error ? err.message : String(err),
-      );
-    }
     throw err;
   } finally {
     markDispatchIdle();
 
     logger.info(
-      `debug-check: accountId=${deps.accountId} debug=${String(debug)} hasContextToken=${Boolean(contextToken)} stateDir=${process.env.OPENCLAW_STATE_DIR ?? "(unset)"}`,
+      `debug-check: accountId=${deps.accountId} debug=${String(debug)} hasContextToken=${Boolean(contextToken)}`,
     );
 
     if (debug && contextToken) {
